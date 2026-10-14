@@ -234,7 +234,12 @@ def test_matrix_reader_retries_when_generation_changes_during_build(
         expected,
     )
 
-    assert result is market
+    # 矩阵返回时附加 PIT universe/leakage 审计 (只读副本), 底层加载只重试一次。
+    assert result is not market
+    assert result.pit_audit is not None
+    assert result.pit_audit["universe"]["mode"] == "all_listed"
+    assert result.pit_audit["universe"]["delisted_included"] is True
+    assert result.pit_audit["leakage_report"]["status"] in {"ok", "degraded"}
     assert calls == ["generation-a", "generation-b"]
 
 

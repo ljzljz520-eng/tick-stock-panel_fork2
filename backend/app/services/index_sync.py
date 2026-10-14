@@ -189,6 +189,114 @@ def sync_etf_instruments(repo: KlineRepository) -> int:
     return etf_df.height
 
 
+def _normalize_constituent_symbols(payload: object) -> list[str] | None:
+    """把 provider/SDK 的成分响应规范为 symbol 列表; 无法识别返回 None。"""
+    if payload is None:
+        return None
+    if isinstance(payload, pl.DataFrame):
+        if "symbol" not in payload.columns:
+            return None
+        symbols = payload["symbol"].cast(pl.Utf8).drop_nulls().to_list()
+    elif isinstance(payload, dict):
+        for key in ("symbols", "constituents", "members", "ts_codes"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                payload = value
+                break
+        else:
+            return None
+        symbols = []
+        for item in payload:
+            if isinstance(item, str):
+                symbols.append(item)
+            elif isinstance(item, dict):
+                code = item.get("symbol") or item.get("ts_code") or item.get("code")
+                if code:
+                    symbols.append(str(code))
+    elif isinstance(payload, list):
+        symbols = []
+        for item in payload:
+            if isinstance(item, str):
+                symbols.append(item)
+            elif isinstance(item, dict):
+                code = item.get("symbol") or item.get("ts_code") or item.get("code")
+                if code:
+                    symbols.append(str(code))
+    else:
+        return None
+    return sorted({str(s) for s in symbols if s}) or None
+
+
+def _fetch_constituents_via_custom_provider(index_symbol: str) -> list[str] | None:
+    """自定义日K provider 的可选成分钩子 ``get_index_constituents``。未实现返回 None。"""
+    provider_name = preferences.get_daily_data_provider()
+    if provider_name == "tickflow":
+        return None
+    from app.data_providers import custom as custom_sources
+
+    if not custom_sources.is_custom_provider(provider_name):
+        return None
+    provider = custom_sources.get_provider(provider_name)
+    getter = getattr(provider, "get_index_constituents", None)
+    if getter is None:
+        return None
+    try:
+        return _normalize_constituent_symbols(getter(index_symbol))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("provider %s 成分拉取失败(%s): %s", provider_name, index_symbol, e)
+        return None
+
+
+def _fetch_constituents_via_tickflow(index_symbol: str) -> list[str] | None:
+    """TickFlow 可选成分接口; SDK 未提供该端点时返回 None (不猜测、不报错)。"""
+    tf = get_client()
+    indices_api = getattr(tf, "indices", None)
+    getter = getattr(indices_api, "get_constituents", None)
+    if getter is None:
+        return None
+    try:
+        return _normalize_constituent_symbols(getter(index_symbol))
+    except Exception as e:  # noqa: BLE001
+        logger.debug("tickflow 成分拉取失败(%s): %s", index_symbol, e)
+        return None
+
+
+def sync_index_constituents(
+    repo: KlineRepository,
+    index_symbols: list[str] | None = None,
+) -> dict[str, int]:
+    """记录核心指数当日成分快照到 PIT 历史, 返回 {index_symbol: 写入行数}。
+
+    成分是 point-in-time 维度: 每个 provider 端点都是可选能力,
+    缺失时跳过 (返回 {}), 回测侧无历史会 fail-closed, 不静默伪造。
+    """
+    from app import pit
+    from app.services.index_const import CORE_INDEX_SYMBOLS
+
+    targets = list(index_symbols or CORE_INDEX_SYMBOLS)
+    data_dir = repo.store.data_dir
+    observed_at = datetime.now().date()
+    recorded: dict[str, int] = {}
+    for index_symbol in targets:
+        symbols = _fetch_constituents_via_custom_provider(index_symbol)
+        if symbols is None:
+            symbols = _fetch_constituents_via_tickflow(index_symbol)
+        if not symbols:
+            logger.info("指数成分能力不可用或为空, 跳过 %s 的 PIT 成分记录", index_symbol)
+            continue
+        try:
+            written = pit.record_constituent_observations(
+                data_dir, index_symbol, symbols, observed_at
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("指数 %s 成分 PIT 记录失败: %s", index_symbol, e)
+            continue
+        if written:
+            recorded[index_symbol] = written
+            logger.info("指数 %s 成分 PIT 记录: %d 只", index_symbol, written)
+    return recorded
+
+
 def sync_and_persist_index_daily(
     repo: KlineRepository,
     capset: CapabilitySet,

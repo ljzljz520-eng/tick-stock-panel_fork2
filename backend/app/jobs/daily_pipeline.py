@@ -540,6 +540,13 @@ def run_now(
                 emit("sync_index", 88, "同步指数维表…")
                 index_count = index_sync.sync_index_instruments(repo, pull_index=True, pull_etf=False)
                 emit("sync_index", 88, f"指数维表完成,{index_count} 只")
+                # 指数成分 PIT 观察: provider 无该能力时静默跳过, 不阻断主管道。
+                try:
+                    constituent_counts = index_sync.sync_index_constituents(repo)
+                    if constituent_counts:
+                        emit("sync_index", 88, f"指数成分记录 {sum(constituent_counts.values())} 条")
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("指数成分 PIT 同步失败 (不影响主管道): %s", e)
                 index_dir = repo.store.data_dir / "kline_index_enriched"
                 index_dates = sorted(
                     d.name[5:] for d in index_dir.glob("date=*")

@@ -574,6 +574,8 @@ class StrategyBacktestConfig:
     # 市场环境过滤: {"states": ["strong",...], "min_score": 60}。
     # 强制 T-1: regime[T-1] 决定 entry[T](防未来函数)。None=不过滤。
     regime_filter: dict | None = None
+    # None: 沿用 symbols 全量; 否则按该指数的 PIT 历史成分定义回测 universe。
+    index_symbol: str | None = None
 
     def __post_init__(self) -> None:
         if self.entry_fill is None:
@@ -653,6 +655,8 @@ class BacktestResultPolicy:
             "panel_columns",
             "feature_columns",
             "full_feature_fallback",
+            "universe_definition",
+            "leakage_report",
         }
         keep = set(self.required_stats) | diagnostic
         return {key: value for key, value in stats.items() if key in keep}
@@ -749,6 +753,7 @@ class StrategyBacktestService:
             config.minute_fill,
             json.dumps(config.overrides or {}, sort_keys=True, ensure_ascii=False, default=str),
             json.dumps(config.regime_filter or {}, sort_keys=True, ensure_ascii=False, default=str),
+            config.index_symbol,
         )
 
     def _resolve_composite_feature_plan(
@@ -965,6 +970,7 @@ class StrategyBacktestService:
                 cache_profile=cache_profile,
                 coverage_start=coverage_start,
                 coverage_end=coverage_end,
+                universe_index=first.index_symbol,
             )
             direct_load_ms = round((time.perf_counter() - started) * 1000, 1)
         else:
@@ -1194,6 +1200,8 @@ class StrategyBacktestService:
         matrix_data_cache_hit = False
         matrix_data_cache_status = "none"
         matrix_data_cache_timing_ms: Mapping[str, float] = {}
+        # PIT 审计在矩阵加载后立即捕获; 后续模拟会显式 del market_data 释放内存。
+        pit_audit = None
 
         # 加载 warmup + 正式区间。矩阵策略的 warmup 由协议解析，不再依赖策略名称。
         warmup_days = max(120, int(max(feature_plan.warmup_bars, 1) * 1.6))
@@ -1226,6 +1234,7 @@ class StrategyBacktestService:
             matrix_data_cache_status = prepared.market_data.cache_status
             matrix_data_cache_hit = matrix_data_cache_status in {"exact", "covering"}
             matrix_data_cache_timing_ms = prepared.market_data.cache_timing_ms
+            pit_audit = getattr(prepared.market_data, "pit_audit", None)
             # 环境过滤下正式起点=矩阵首日时顺延 (首日让渡为预热)
             if config.regime_filter:
                 config = self._clamp_regime_formal_start(
@@ -1266,6 +1275,7 @@ class StrategyBacktestService:
                     cache_profile=cache_profile,
                     coverage_start=coverage_start,
                     coverage_end=coverage_end,
+                    universe_index=config.index_symbol,
                 )
             except (ValueError, OSError) as e:
                 return _err(f"回测矩阵准备失败: {e}")
@@ -1276,6 +1286,7 @@ class StrategyBacktestService:
             matrix_data_cache_status = market_data.cache_status
             matrix_data_cache_hit = matrix_data_cache_status in {"exact", "covering"}
             matrix_data_cache_timing_ms = market_data.cache_timing_ms
+            pit_audit = getattr(market_data, "pit_audit", None)
             # 环境过滤下正式起点=矩阵首日时顺延 (首日让渡为预热)
             if config.regime_filter:
                 config = self._clamp_regime_formal_start(
@@ -1685,6 +1696,25 @@ class StrategyBacktestService:
             result.stats["shared_market_data_bytes"] = prepared.market_data.nbytes
             result.stats["shared_prepare_timing_ms"] = prepared.prepare_timing_ms
             result.stats["matrix_compute_cache"] = prepared.compute_cache.snapshot()
+
+        # PIT 防未来函数: 结果必须携带 universe 定义与 leakage 报告;
+        # violation 状态意味着历史日期读到了之后才可知的字段, 任务失败。
+        if pit_audit is not None:
+            leakage_report = pit_audit.get("leakage_report")
+            result.stats["universe_definition"] = pit_audit.get("universe")
+            result.stats["leakage_report"] = leakage_report
+            if leakage_report and leakage_report.get("status") == "violation":
+                from app.pit import FutureLeakageError
+
+                raise FutureLeakageError(
+                    "回测数据存在 look-ahead 泄露 (future-known field):\n"
+                    + "\n".join(
+                        str(item)
+                        for dim in leakage_report.get("dimensions", [])
+                        if dim.get("status") == "violation"
+                        for item in dim.get("evidence", [])
+                    )
+                )
 
         benchmark_curve = (
             self._build_benchmark_curve(config.start, config.end)
@@ -2533,6 +2563,7 @@ class StrategyBacktestService:
             "holding_days": c.holding_days,
             "minute_fill": c.minute_fill,
             "regime_filter": c.regime_filter,
+            "index_symbol": c.index_symbol,
         }
 
     @staticmethod

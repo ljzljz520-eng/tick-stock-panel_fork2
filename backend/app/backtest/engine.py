@@ -12,6 +12,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -475,6 +476,23 @@ class BacktestEngine:
                     how="left",
                 )
 
+            # 面板路径同样统一走 PIT as-of: 名称/ST/股本按交易日可知值,
+            # 不把今日维表快照静态投影到历史日期。
+            if asset_type == "stock" and self.repo is not None:
+                from app import pit
+
+                pit_history = pit.load_instrument_history(self.repo.store.data_dir)
+                if not pit_history.is_empty():
+                    df = pit.attach_pit_columns_panel(df, pit_history)
+                    for static_col, pit_col in (
+                        ("total_shares", pit.PIT_TOTAL_SHARES),
+                        ("float_shares", pit.PIT_FLOAT_SHARES),
+                    ):
+                        if pit_col in df.columns and static_col in df.columns:
+                            df = df.with_columns(
+                                pl.coalesce([pit_col, static_col]).alias(static_col)
+                            )
+
         required_columns = set(feature_plan.base_columns) | set(feature_plan.instrument_columns)
         required_columns |= set(feature_plan.signal_columns)
         if not matrix_native:
@@ -507,11 +525,41 @@ class BacktestEngine:
         coverage_end: date | None = None,
         expected_generation: str | None = None,
         cancel_event: threading.Event | None = None,
+        universe_index: str | None = None,
     ) -> MarketDataMatrix:
         """Load a matrix-native backtest directly from projected parquet batches."""
         if feature_plan.execution_backend != "matrix_native":
             raise ValueError("direct market matrix loading requires matrix_native backend")
+        from app import pit
         from app.tickflow.repository import enriched_dirname
+
+        data_dir = self.repo.store.data_dir if self.repo is not None else None
+        # Universe 解析: 显式 symbols / 指数 PIT 成分 / 全市场 (含退市, 逐日门控)。
+        universe = pit.resolve_matrix_universe(
+            explicit_symbols=symbols,
+            index_symbol=universe_index if asset_type == "stock" else None,
+            data_dir=data_dir,
+            start=start,
+            end=end,
+            asset_type=asset_type,
+        )
+        resolved_symbols = (
+            list(universe.symbols) if universe.symbols is not None else None
+        )
+        pit_history = (
+            pit.load_instrument_history(data_dir)
+            if data_dir is not None and asset_type == "stock"
+            else pl.DataFrame()
+        )
+        constituent_history = pl.DataFrame()
+        member_symbols_by_date = None
+        if universe_index and asset_type == "stock" and data_dir is not None:
+            constituent_history = pit.load_constituent_history(
+                data_dir, universe_index
+            )
+            member_symbols_by_date = pit.member_sets_by_window(
+                constituent_history, universe_index, start, end
+            )
 
         parquet_root = self.repo.store.data_dir / enriched_dirname(asset_type)
         instruments = self.repo.get_instruments_asset(asset_type)
@@ -548,7 +596,7 @@ class BacktestEngine:
                     start,
                     end,
                     field_columns=field_columns,
-                    symbols=symbols,
+                    symbols=resolved_symbols,
                     instruments=instruments,
                     cache_root=cache_root,
                     coverage_start=coverage_start,
@@ -562,6 +610,21 @@ class BacktestEngine:
                     cancel_event=cancel_event,
                 )
                 self.assert_data_generation(asset_type, source_generation)
+                market = self._attach_pit_dimensions_and_audit(
+                    market,
+                    pit_history,
+                    data_dir=data_dir,
+                    start=start,
+                    snapshot=instruments,
+                    universe_definition=universe.definition,
+                    asset_type=asset_type,
+                    universe_index=universe_index,
+                    constituent_history=constituent_history,
+                    member_symbols_by_date=member_symbols_by_date,
+                    fundamental_columns=getattr(
+                        feature_plan, "fundamental_columns", frozenset()
+                    ),
+                )
                 from app.backtest.fundamentals import attach_matrix_fundamental_fields
 
                 fundamental_names = sorted(
@@ -587,6 +650,116 @@ class BacktestEngine:
         raise EnrichedGenerationUnavailableError(
             "unable to read a stable enriched matrix snapshot"
         )
+
+    def _attach_pit_dimensions_and_audit(
+        self,
+        market: MarketDataMatrix,
+        pit_history: pl.DataFrame,
+        *,
+        data_dir: Path | None,
+        start: date,
+        snapshot: pl.DataFrame,
+        universe_definition,
+        asset_type: str,
+        universe_index: str | None,
+        constituent_history: pl.DataFrame | None,
+        member_symbols_by_date: dict[date, set[str]] | None,
+        fundamental_columns: frozenset[str] | set[str] | None,
+    ) -> MarketDataMatrix:
+        """附加 PIT 时变维度, 并把 universe 定义与 leakage 审计挂到矩阵。
+
+        违例 (历史日期读到之后才可知的字段) 会在此处直接终止任务;
+        无 PIT 历史时降级为最新维表快照并在报告中留下 degraded 证据。
+        """
+        from types import MappingProxyType
+
+        from app import pit
+
+        dimensions: list[dict] = []
+        instrument_pit_used = bool(
+            asset_type == "stock" and pit_history is not None and not pit_history.is_empty()
+        )
+        if asset_type == "stock" and (instrument_pit_used or member_symbols_by_date):
+            market = pit.attach_pit_fields_to_market(
+                market,
+                pit_history,
+                member_symbols_by_date=member_symbols_by_date,
+            )
+        dimensions.append(pit.instrument_dimension_audit(
+            history=pit_history,
+            pit_used=instrument_pit_used,
+            snapshot=None if instrument_pit_used else snapshot,
+            start=start,
+        ))
+        dimensions.append(pit.constituent_dimension_audit(
+            history=constituent_history,
+            index_symbol=universe_index,
+        ))
+        if asset_type == "stock" and data_dir is not None:
+            columns = set(fundamental_columns or ())
+            if columns:
+                dimensions.append(self._pit_financial_audit(
+                    data_dir, "metrics/part.parquet", "financial_metrics",
+                    gate="trade_date > announce_date (公告次日生效)", start=start,
+                ))
+            # 历史股本被涨跌停信号/换手率路径消费, 始终留痕。
+            dimensions.append(self._pit_financial_audit(
+                data_dir, "shares/part.parquet", "financial_shares",
+                gate="trade_date >= announce_date", start=start,
+            ))
+
+        report = pit.build_leakage_report(dimensions)
+        violations = [
+            pit.LeakageViolation(**item)
+            for dim in report["dimensions"]
+            if dim.get("status") == "violation"
+            for item in dim.get("evidence", [])
+        ]
+        pit.raise_if_leakage(violations)
+        audit = MappingProxyType({
+            "universe": dict(universe_definition),
+            "leakage_report": report,
+        })
+        return pit.replace_matrix(market, pit_audit=audit)
+
+    @staticmethod
+    def _pit_financial_audit(
+        data_dir: Path,
+        relative_path: str,
+        table: str,
+        *,
+        gate: str,
+        start: date,
+    ) -> dict:
+        """已按公告日门控的财务表审计留痕; 统计窗口之后才公告 (被排除) 的行数。"""
+        from app import pit
+
+        path = data_dir / "financials" / relative_path
+        if not path.exists():
+            return pit.announcement_dimension_audit(
+                table=table, rows=0, gate=gate, available=False
+            )
+        try:
+            frame = pl.scan_parquet(path)
+            if "announce_date" not in frame.collect_schema().names():
+                raise ValueError("announce_date 列缺失")
+            rows = frame.select(pl.len()).collect().item()
+            future_rows = (
+                frame.filter(
+                    pl.col("announce_date").cast(pl.Utf8).str.slice(0, 10).str.to_date(strict=False) > start
+                )
+                .select(pl.len())
+                .collect()
+                .item()
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("PIT 审计读取 %s 失败: %s", table, exc)
+            return pit.announcement_dimension_audit(
+                table=table, rows=0, gate=gate, available=False
+            )
+        return pit.announcement_dimension_audit(
+            table=table, rows=int(rows), gate=gate, available=True
+        ) | {"announced_after_start_excluded": int(future_rows)}
 
     def cache_stats(self) -> dict:
         """暴露 PanelCache 遥测快照 (扫盘耗时/次数/命中/复用), 供上层量化 IO 占比。"""

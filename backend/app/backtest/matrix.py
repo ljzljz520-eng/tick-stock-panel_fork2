@@ -28,6 +28,13 @@ import pyarrow.dataset as pads
 
 from app.backtest.minute_trigger import build_minute_exit_reference
 from app.backtest.numba_runtime import run_numba_parallel
+from app.pit import (
+    PIT_FLOAT_SHARES,
+    PIT_IS_ST,
+    PIT_LISTED,
+    PIT_MEMBER,
+    PIT_TOTAL_SHARES,
+)
 from app.price_limits import (
     MAIN_BOARD_ST_LIMIT_CHANGE_DATE,
     numpy_limit_pct_vectors,
@@ -444,6 +451,12 @@ class MarketDataMatrix:
     cache_lease: Any | None = field(default=None, compare=False, repr=False)
     vector_fields: frozenset[str] = field(default_factory=frozenset)
     cache_timing_ms: Mapping[str, float] = field(default_factory=dict)
+    # point-in-time 维度审计 (universe 定义 + leakage report); None 表示未经 PIT 路径。
+    pit_audit: Mapping[str, Any] | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
     _valid_bars: ValidBarIndex | None = field(
         default=None,
         compare=False,
@@ -2494,6 +2507,7 @@ def slice_market_data_matrix(market: MarketDataMatrix, start: int, stop: int) ->
         cache_lease=market.cache_lease,
         vector_fields=market.vector_fields,
         cache_timing_ms=market.cache_timing_ms,
+        pit_audit=market.pit_audit,
     )
     _make_read_only(
         result.timestamps,
@@ -3651,20 +3665,35 @@ def _build_basic_filter_mask_uncached(market: MarketDataMatrix, config: dict) ->
     if config.get("price_max") is not None:
         mask &= close <= float(config["price_max"])
 
-    _apply_bound(mask, close * _optional_field(market, "total_shares"), config, "market_cap")
-    _apply_bound(mask, close * _optional_field(market, "float_shares"), config, "float_cap")
+    # 市值/流通市值: 优先使用 point-in-time 历史股本矩阵 (逐日 as-of),
+    # 维表静态股本只在 PIT 历史缺失时作为降级。
+    _apply_bound(mask, close * _pit_or_static_field(market, PIT_TOTAL_SHARES, "total_shares"), config, "market_cap")
+    _apply_bound(mask, close * _pit_or_static_field(market, PIT_FLOAT_SHARES, "float_shares"), config, "float_cap")
     _apply_bound(mask, _required_field_for_bound(market, config, "amount"), config, "amount")
     _apply_bound(mask, _optional_field(market, "turnover_rate"), config, "turnover")
 
     if config.get("exclude_st"):
-        asset_mask = np.array(
-            [
-                not any(token in name.upper() for token in ("ST", "*ST", "退"))
-                for name in market.names
-            ],
-            dtype=bool,
-        )
-        mask &= asset_mask[None, :]
+        pit_st = market.fields.get(PIT_IS_ST)
+        if pit_st is not None:
+            # PIT: 名称的 ST/*ST 状态按当日可知名称逐日判定, 不把今天的状态投影到过去。
+            mask &= ~pit_st
+        else:
+            asset_mask = np.array(
+                [
+                    not any(token in name.upper() for token in ("ST", "*ST", "退"))
+                    for name in market.names
+                ],
+                dtype=bool,
+            )
+            mask &= asset_mask[None, :]
+
+    # PIT 逐日门控: 上市日之前不可交易; 指数 universe 下非成分日不候选。
+    pit_listed = market.fields.get(PIT_LISTED)
+    if pit_listed is not None:
+        mask &= pit_listed
+    pit_member = market.fields.get(PIT_MEMBER)
+    if pit_member is not None:
+        mask &= pit_member
 
     boards = config.get("boards")
     if isinstance(boards, list) and boards:
@@ -4225,6 +4254,18 @@ def _optional_field(market: MarketDataMatrix, name: str) -> np.ndarray:
     if values is None:
         return np.full(market.shape, np.nan, dtype=np.float32)
     return values
+
+
+def _pit_or_static_field(
+    market: MarketDataMatrix,
+    pit_name: str,
+    static_name: str,
+) -> np.ndarray:
+    """时变维度优先取 PIT as-of 矩阵; 缺失时降级维表静态列。"""
+    values = market.fields.get(pit_name)
+    if values is not None:
+        return values
+    return _optional_field(market, static_name)
 
 
 def _required_field_for_bound(

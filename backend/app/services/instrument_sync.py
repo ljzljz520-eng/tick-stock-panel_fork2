@@ -101,6 +101,14 @@ def sync_instruments(data_dir: Path) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_parquet(df, out)
 
+    # 累积 point-in-time 维度观察: 历史名称/股本/上市轨迹与退市标记的唯一复原来源。
+    try:
+        from app import pit
+
+        pit.record_instrument_observations(data_dir, df, date.today())
+    except Exception as e:  # noqa: BLE001
+        logger.warning("instruments PIT 观察记录失败 (不影响本次维表同步): %s", e)
+
     logger.info("instruments synced: %d rows → %s", df.height, out)
     return df.height
 

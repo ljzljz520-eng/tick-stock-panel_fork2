@@ -1592,8 +1592,14 @@ class StrategyEngine:
             exprs.append(pl.col("turnover_rate") >= bf["turnover_min"])
         if bf.get("turnover_max") is not None and "turnover_rate" in df.columns:
             exprs.append(pl.col("turnover_rate") <= bf["turnover_max"])
-        if bf.get("exclude_st") and "name" in df.columns:
-            exprs.append(~pl.col("name").str.contains("(?i)ST|\\*ST|退"))
+        if bf.get("exclude_st"):
+            # 回测面板携带逐日 PIT ST 标记时按当日状态过滤, 不用今日名称投影历史。
+            from app.pit import PIT_IS_ST
+
+            if PIT_IS_ST in df.columns:
+                exprs.append(~pl.col(PIT_IS_ST))
+            elif "name" in df.columns:
+                exprs.append(~pl.col("name").str.contains("(?i)ST|\\*ST|退"))
         # 板块过滤
         boards = bf.get("boards")
         if boards and isinstance(boards, list) and len(boards) > 0:
